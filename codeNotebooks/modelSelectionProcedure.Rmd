@@ -1,0 +1,554 @@
+---
+title: "Tartan Data Science Cup Episode II: Model Selection Procedure"
+subtitle: "Anderson, Section A"
+author: "Michael Rosenberg, mmrosenb@andrew.cmu.edu"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+fontsize: 16pt
+output:
+  pdf_document:
+    toc: false
+  html_document:
+    toc: false
+---
+
+```{r,cacheLoadin,include=FALSE}
+#load in libraries
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(DiagrammeR)
+library(np)
+library(mgcv)
+library(xgboost)
+#set options
+opts_chunk$set(cache=TRUE, autodep=TRUE, message=FALSE, warning=FALSE)
+options(show.signif.stars=FALSE)
+#set certain globals
+sigLev = 3 #general global for rounding variables
+pchVal = 19 #for plotting standards
+```
+
+Let us first load in our processed dataset.
+
+```{r,echo = FALSE}
+householdFrame = read_csv("../data/processed/householdLagFrame.csv")
+```
+
+\section{Summary Statistics of Variables}
+
+Let us look at some of the tabulations of our variables
+
+```{r,checkCounts,echo = FALSE}
+table(householdFrame$eggPurchase_week0)
+```
+
+_Table 1: The distribution of egg purchases for our target variable._
+
+For our target variable, we have many more observations of non-egg purchases
+versus egg purchases. Thus, it looks like we will be facing a major imbalanced
+classes problem.
+
+```{r,crossTabsOfLags,echo = FALSE}
+#this week on first lag
+mainOnFirstLag = table(householdFrame$eggPurchase_week1,
+                       householdFrame$eggPurchase_week0)
+mainGivenFirstLag = prop.table(mainOnFirstLag,margin = 1)
+kable(mainGivenFirstLag)
+```
+
+_Table 2: This week's egg purchase (columns) given last week's egg purchase
+(rows)._
+
+We see that the distribution of egg purchases this week looks to vary by about
+$10\%$ given purchases last week.
+
+```{r,crossTabsOfSecondLag,echo = FALSE}
+#this week on second lag
+mainOnSecondLag = table(householdFrame$eggPurchase_week2,
+                       householdFrame$eggPurchase_week0)
+mainGivenSecondLag = prop.table(mainOnSecondLag,margin = 1)
+kable(mainGivenSecondLag)
+```
+
+_Table 3: This week's egg purchase (columns)  given the egg purchase two weeks
+ago (rows)._
+
+We are now starting to see a somewhat meaningful effect; if one purchased eggs
+two weeks ago, one is much more likely to purchase eggs this week than if they
+didn't purchase eggs two weeks ago. This suggests that my hypothesis on the
+predictive effect of the lags should hold, as it looks like the cyclical
+patterns of egg purchases seems to occur.
+
+```{r,crossTabsOfThirdLag,echo = FALSE}
+#this week on third lag
+mainOnThirdLag = table(householdFrame$eggPurchase_week3,
+                       householdFrame$eggPurchase_week0)
+mainGivenThirdLag = prop.table(mainOnThirdLag,margin = 1)
+kable(mainGivenThirdLag)
+```
+
+_Table 4: This week's egg purchase (columns) given the egg purchase three weeks
+ago (rows)._
+
+The predictive effect of the third lag towards the purchase this week looks to
+be similar to the predictive effect of the second lag towards the purchase this
+week. It is difficult to say why both weeks seem to have similar effects, but
+it may suggest that the general cycle of egg purchases sits between 2-3 weeks.
+
+Let us study some of our static variables.
+
+```{r,checkMissingValues,echo = FALSE}
+#check missing values on each of our variables
+propMissing <- function(varName,givenFrame = householdFrame){
+    #quick helper to check the proportion of missing values for a given
+    #variable
+    numMissing = length(which(is.na(givenFrame[varName])))
+    numObs = dim(givenFrame[varName])[1]
+    return(numMissing/numObs)
+}
+#consider our demographic variables
+demographicVarVec = c("MARITAL_STATUS_CODE","AGE_DESC","INCOME_DESC",
+                      "HOMEOWNER_DESC","HH_COMP_DESC","HOUSEHOLD_SIZE_DESC",
+                      "KID_CATEGORY_DESC")
+propMissingVec = sapply(demographicVarVec,propMissing)
+#make viewable table
+demographicFrame = data.frame(demographicVariable = demographicVarVec,
+                              proportionMissing = propMissingVec)
+kable(demographicFrame,row.names = FALSE)
+```
+
+_Table 5: Our Demographic Variables with missing values._
+
+We see that across the board, about $65%$ of our observations contain missing
+values for the demographic variables. This is a bad sign for the usability
+of demographic variables, but it may suggest that if we wanted to consider
+demographic variables in our model, we would need to spend some time
+considering a mixed classification method in which we did not use demographic
+variables to predict on observations with missing values for those variables.
+
+\section{Create initial model}
+
+We will start by making an initial model over two of our lags, the number of
+trips a household had made to the store, the average loyalty discount per
+basket, and the average spending amount per basket. Since eggs are likely a
+price inelastic good, it is likely for our price variables to be dropped on
+the way.
+
+```{r,createOverallModel,echo = FALSE}
+initialOverallMod.logr = glm(eggPurchase_week0 ~ eggPurchase_week1 +
+                                eggPurchase_week2 + numBaskets
+                             + avgBasketLoyaltyDiscount + avgSpendAmtPerBasket,
+                             data = householdFrame, family = "binomial")
+#check accuracy
+#for the future, use prediction functions adapted from ../pipeline/predict.r
+source("../pipeline/predict.r")
+#then make our predictions
+decisionRule = .5
+givenPredictions = customPredict(initialOverallMod.logr,householdFrame,
+                                 decisionRule)
+propAccurate = getAccuracy(givenPredictions,householdFrame$eggPurchase_week0)
+percentMul = 100
+percentAccurate = propAccurate * percentMul
+```
+
+We are doing a pretty good job so far on the data, as $`r percentAccurate `\%$
+of the data is being correctly predicted by our current model. Let us see our
+confusion matrix to study the quality of our misclassification rate.
+
+```{r,makeConfusionMat,echo = FALSE}
+#make confusion matrix
+confusionMat = matrix(data = 0,nrow = 2,ncol = 2)
+for (row in 1:2){
+    for (col in 1:2){
+        confusionMat[row,col] = length(which(givenPredictions == (row - 1) &
+                            householdFrame$eggPurchase_week0 == (col-1)))
+    }
+}
+#get labels
+rownames(confusionMat) = c("predict 0","predict 1")
+colnames(confusionMat) = c("actual 0","actual 1")
+kable(confusionMat)
+```
+
+_Table 5: Confusion Matrix of our initial overall model._
+
+We see that we generally have a pretty high false negative rate. Let's take
+a look at some of our variables related to these individuals with high false
+negative rates.
+
+```{r,viewResponseScores,echo = FALSE}
+#distinguish between probabilities and classes
+predictedProbabilities = customPredict(initialOverallMod.logr,householdFrame)
+predictedClasses = givenPredictions
+#then get false negatives
+falseNegativeRows = which(predictedClasses == 0 
+                         & householdFrame$eggPurchase_week0 == 1)
+falseNegativePredictions = predictedProbabilities[falseNegativeRows]
+#plot distribution
+(qplot(falseNegativePredictions,geom = "histogram") +
+    xlab("Predicted Probabilities") +
+    ggtitle("Distribution of Predicted Probabilities\nFor False Negatives"))
+```
+
+_Figure 1: Distribution of Predicted Probabilities for False Negative
+occurences._
+
+We see that a lot of the predicted probabilities tend to be very close
+to $0$, as there are few observations that are in the borderlin $[.4,.5]$ range.
+Thus, this looks not to be an aspect of model uncertainty and more of an aspect
+of potential predictors.
+
+```{r,lookAtQuantitativeOutcomes,echo = FALSE}
+falseNegativeObsFrame = householdFrame[falseNegativeRows,]
+#look at our quantitative predictors
+#number of trips made
+numBasketPlot = (qplot(falseNegativeObsFrame["numBaskets"],
+                      geom = "histogram") +
+                      xlab("Number of Baskets") +
+                      ggtitle("Distribution of\nNumber of Baskets"))
+#mean loyalty discount
+meanLoyalDiscPlot = (qplot(falseNegativeObsFrame$avgBasketLoyaltyDiscount,
+                      geom = "histogram") +
+                      xlab("Average Loyalty Discount per Basket") +
+                      ggtitle(
+                    "Distribution of Average Loyalty\nDiscount Per Basket"))
+#mean net amount purchased in basket
+meanNetBasketAmtPlot = (qplot(falseNegativeObsFrame$avgSpendAmtPerBasket,
+                        geom = "histogram")
+                        + xlab("Average Net Price Amount per Basket")
+                        + ggtitle(
+                    "Distribution of Average\nNet Basket Prices"))
+#multiplot: function taken from
+#http://www.cookbook-r.com/Graphs/Multiple_graphs_on_one_page_(ggplot2)/
+# Multiple plot function
+#
+# ggplot objects can be passed in ..., or to plotlist (as a list of ggplot objects)
+# - cols:   Number of columns in layout
+# - layout: A matrix specifying the layout. If present, 'cols' is ignored.
+#
+# If the layout is something like matrix(c(1,2,3,3), nrow=2, byrow=TRUE),
+# then plot 1 will go in the upper left, 2 will go in the upper right, and
+# 3 will go all the way across the bottom.
+#
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+
+  numPlots = length(plots)
+
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                    ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+
+ if (numPlots==1) {
+    print(plots[[1]])
+
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+multiplot(numBasketPlot,meanLoyalDiscPlot,meanNetBasketAmtPlot,cols=2)
+```
+
+_Figure 2: Distribution of some of our quantitative predictors for our
+false negative observations._
+
+We generally see that our false-negative observations tend to behave rather
+typically for our quantitative variables, and so they don't seem to be
+significant drivers of the false negative rate when we look at the coefficient
+estimates of our initial model.
+
+```{r,eggPurchaseWeek2OnOutcome,echo = FALSE}
+#get outcome on egg purchased in week 0 on egg purchased in week 2 for false
+#negatives
+falseNegativeOutcomeOnEggPurchaseWeekTwo = table(
+                                    falseNegativeObsFrame$eggPurchase_week2,
+                                    falseNegativeObsFrame$eggPurchase_week0)
+kable(falseNegativeOutcomeOnEggPurchaseWeekTwo)
+```
+
+_Table 6: False Negative Outcome (Column) on the second lag of egg purchase
+(Rows)_
+
+It is apparent that a lot of our issues are driven by the fact that our second
+lag has such a large estimated coefficient and yet so many of the observations
+do not have a purchase of eggs on the two weeks before the current week. Let us
+see what happens when we extend our model to three weeks.
+
+```{r,additionalMod,echo = FALSE}
+appendedOverallMod.logr = glm(eggPurchase_week0 ~ eggPurchase_week1 +
+                                eggPurchase_week2 + eggPurchase_week3 + 
+                                  numBaskets
+                             + avgBasketLoyaltyDiscount + avgSpendAmtPerBasket,
+                             data = householdFrame, family = "binomial")
+#accuracy of this model
+predictedClasses = customPredict(appendedOverallMod.logr,householdFrame,
+                                 decisionRule)
+newPropAccurate = getAccuracy(predictedClasses,householdFrame$eggPurchase_week0)
+newPercentAccurate = newPropAccurate * percentMul
+```
+
+We see that the accuracy increase of this model from the previous on is
+$`r newPercentAccurate - percentAccurate`%$. Thus, this model is only making
+minimal improvements.
+
+```{r,checkConfusionMat,echo = FALSE}
+#make our confusion matrix
+confusionMat = matrix(data = 0,nrow = 2,ncol = 2)
+for (row in 1:2){
+    for (col in 1:2){
+        confusionMat[row,col] = length(
+                        which(predictedClasses == (row - 1) &
+                            householdFrame$eggPurchase_week0 == (col-1)))
+    }
+}
+#get labels
+rownames(confusionMat) = c("predict 0","predict 1")
+colnames(confusionMat) = c("actual 0","actual 1")
+kable(confusionMat)
+```
+
+_Table 7: Confusion Matrix for our appended model._
+
+We see that despite our additional lag, we still have a major false negative
+rate.
+
+Let us see how well we can build a model on observations that have
+demographic variables.
+
+```{r,considerModForDemographicObs,echo = False}
+#subset the data
+demographicHouseholdFrame = householdFrame[which(
+                        !is.na(householdFrame$MARITAL_STATUS_CODE)),]
+initialDemographicMod.logr = glm(eggPurchase_week0 ~ eggPurchase_week1 +
+                                eggPurchase_week2 + eggPurchase_week3 + 
+                                  numBaskets
+                        + avgBasketLoyaltyDiscount + avgSpendAmtPerBasket
+                        + factor(MARITAL_STATUS_CODE) + factor(AGE_DESC)
+                        + factor(INCOME_DESC) + factor(HOMEOWNER_DESC)
+                        + factor(HH_COMP_DESC) + factor(HOUSEHOLD_SIZE_DESC)
+                        + factor(KID_CATEGORY_DESC),
+                        data = demographicHouseholdFrame, family = "binomial")
+#check accuracy of this model
+demographicPredClasses = customPredict(initialDemographicMod.logr,
+                                       demographicHouseholdFrame,decisionRule)
+accuracyWithDemo = getAccuracy(demographicPredClasses,
+                               demographicHouseholdFrame$eggPurchase_week0)
+#check accuracy on this dataset with a model without demographic variables
+nonDemographicPredClasses = customPredict(appendedOverallMod.logr,
+                                          demographicHouseholdFrame,
+                                          decisionRule)
+accuracyWithoutDemo = getAccuracy(nonDemographicPredClasses,
+                                  demographicHouseholdFrame$eggPurchase_week0)
+```
+
+We see that we get a `r accuracyWithDemo` on the demographic observations with
+our demographic model and a `r accuracyWithoutDemo` on the demographic
+observations with our non-demographic model.
+Interestingly, the performance of this new model on the demographic data is
+about as good as the old model on this current demographic data.
+
+\section{Model Selection}
+
+We will initially consider two methods: one where we train a 
+demographic-intensive model on our demographic-available observations and 
+one where we train a non-demographic-intensive model on our observations
+without demographic variables. Let us do a
+data split 70-30, and then perform a forward-backward selection upon them using
+AIC.
+
+```{r,dataSplit,echo = FALSE}
+#get sample of households for training
+householdKeyVec = unique(householdFrame$household_key)
+trainPortion = .7
+sampleSize = round(length(householdKeyVec) * trainPortion)
+trainHouseholds = sample(householdKeyVec,sampleSize)
+#make train and test sets
+trainSet = householdFrame[which(
+                householdFrame$household_key %in% trainHouseholds),]
+testSet = householdFrame[which(
+                !(householdFrame$household_key %in% trainHouseholds)),]
+#split dataset for demo versus non demo
+demoTrainSet = trainSet[which(!(is.na(trainSet$MARITAL_STATUS_CODE))),]
+nonDemoTrainSet = trainSet[which((is.na(trainSet$MARITAL_STATUS_CODE))),]
+demoTestSet = testSet[which(!(is.na(testSet$MARITAL_STATUS_CODE))),]
+nonDemoTestSet = testSet[which((is.na(testSet$MARITAL_STATUS_CODE))),]
+```
+
+```{r,modelSelectionOnNonDemo,echo = FALSE}
+#get base for non-demographic model
+baseNonDemo = glm(eggPurchase_week0 ~ eggPurchase_week1,data = nonDemoTrainSet,
+           family = "binomial")
+#get full for non-demographic model
+fullNonDemo = glm(eggPurchase_week0 ~ eggPurchase_week1 +
+                                eggPurchase_week2 + eggPurchase_week3 + 
+                                  numBaskets
+                             + avgBasketLoyaltyDiscount + avgSpendAmtPerBasket,
+                             data = nonDemoTrainSet, family = "binomial")
+#perform forward-backward
+selectedNonDemoMod.logr = step(baseNonDemo,
+                        scope = list(lower = baseNonDemo,upper = fullNonDemo),
+                        data = nonDemoTrainSet,direction = "both")
+```
+
+```{r,modelSelectionOnDemo,echo = FALSE}
+#get base for demographic model
+baseDemo = glm(eggPurchase_week0 ~ eggPurchase_week1,data = demoTrainSet,
+               family = "binomial")
+#get full
+fullDemo = glm(eggPurchase_week0 ~ eggPurchase_week1 +
+                                eggPurchase_week2 + eggPurchase_week3 + 
+                                  numBaskets
+                             + avgBasketLoyaltyDiscount + avgSpendAmtPerBasket
+                             + factor(MARITAL_STATUS_CODE) + factor(AGE_DESC)
+                             + factor(INCOME_DESC) + factor(HOMEOWNER_DESC)
+                        + factor(HH_COMP_DESC) + factor(HOUSEHOLD_SIZE_DESC)
+                        + factor(KID_CATEGORY_DESC),
+                        data = demoTrainSet, family = "binomial")
+#perform forward-backward
+selectedDemoMod.logr = step(baseDemo,
+                            scope = list(lower = baseDemo,upper = fullDemo),
+                            data = demoTrainSet,direction = "both")
+```
+
+```{r,makePredictFunc,echo = FALSE}
+#check model performance on holdout sets
+#with demographic predictions
+demoPred = customPredict(selectedDemoMod.logr,demoTestSet,decisionRule)
+demoAccuracy = getAccuracy(demoPred,demoTestSet$eggPurchase_week0)
+#without demographic predictions
+nonDemoPred = customPredict(selectedNonDemoMod.logr,nonDemoTestSet,decisionRule)
+nonDemoAccuracy = getAccuracy(nonDemoPred,nonDemoTestSet$eggPurchase_week0)
+```
+
+They are both doing pretty weel, with around $82\%$ on the demographic
+test set for the demographic model and around $92.39\%$ on the non-demographic
+test set for the non-demographic model.
+
+```{r,seeOverallPrediction,echo = FALSE}
+#get overall accuracy for mixed model
+propMixedAccurate = (demoAccuracy * dim(demoTestSet)[1] 
+                + nonDemoAccuracy * dim(nonDemoTestSet)[1]) / dim(testSet)[1]
+#see how well we predict with just the non demographic model
+overallNonDemoMod.logr = glm(selectedNonDemoMod.logr$formula,data = trainSet,
+                             family = "binomial")
+overallNonDemoPred = customPredict(overallNonDemoMod.logr,testSet,decisionRule)
+propOverallNonDemoAccurate = getAccuracy(overallNonDemoPred,
+                                         testSet$eggPurchase_week0)
+```
+
+We see that with our mixed logistic model, the accuracy on our test set is
+$`r signif(propMixedAccurate,sigLev)`$ while for our simple logistic model, 
+the accuracy
+on our test set is $`r signif(propOverallNonDemoAccurate,sigLev)`$.
+Thus, we seem to actually
+be doing slight better with the simpler model on our test set.
+
+Let us try to compare the performance of these models with a much more
+complicated model, such as gradient boosting machine with regularization.
+
+```{r,trainXGBoostClassifier,echo = FALSE}
+#attempt at xgboost
+#prepare training matrix
+predictorTrainSet = trainSet[,c("eggPurchase_week1","eggPurchase_week2",
+                                "eggPurchase_week3","numBaskets",
+                                "avgBasketLoyaltyDiscount",
+                                "avgSpendAmtPerBasket")]
+predictorTrainMat = as.matrix(predictorTrainSet)
+#then fit
+trainedXgboost = xgboost(data = predictorTrainMat,
+                         label = trainSet$eggPurchase_week0,
+                            booster = "gbtree", 
+                            objective = "binary:logistic", 
+                            max.depth = 5, 
+                            eta = 0.5, 
+                            nthread = 2, 
+                            nround = 2, 
+                            min_child_weight = 1, 
+                            subsample = 0.5, 
+                            colsample_bytree = 1, 
+                            num_parallel_tree = 1)
+```
+
+```{r,testXGBoostClassifier,echo = FALSE}
+#get predictors ready
+predictorTestSet = testSet[,c("eggPurchase_week1","eggPurchase_week2",
+                                "eggPurchase_week3","numBaskets",
+                                "avgBasketLoyaltyDiscount",
+                                "avgSpendAmtPerBasket")]
+predictorTestMat = as.matrix(predictorTestSet)
+xgboostPred = ifelse(
+    predict(trainedXgboost,newdata = predictorTestMat) < decisionRule,0,1)
+numXgboostCorrect = length(which(xgboostPred == testSet$eggPurchase_week0))
+xgboostAccuracy = numXgboostCorrect / length(testSet$eggPurchase_week0)
+```
+
+We see that the accuracy of our GBM with regularization on our test set is
+$`r signif(xgboostAccuracy,sigLev)`$. This actually performs slightly worse on
+the test set than our simple logistic model.
+
+If it is computationally reasonable, let us try to fit a kernel regression to
+this data using our non-demographic model to study if it may be useful to
+consider a nonparametric method.
+
+```{r,nonParAndSemiParMethods,echo = FALSE,eval = FALSE}
+#fit kernel regression
+consideredMod.np = npreg(eggPurchase_week0 ~
+                         eggPurchase_week1 + eggPurchase_week2
+                         + eggPurchase_week3 + numBaskets,data = trainSet)
+#too slow
+```
+
+\section{Final Model and Predictions}
+
+My final model will be a logistic regression of eggs purchased this week on
+its three lags and the number of overall trips a given household has made to the
+store.
+
+Let us get the predicted probabilities of households purchasing eggs next week.
+
+```{r,makePredictionsOnFullDataset,echo = FALSE}
+#fit final model on the training set
+finalMod.logr = glm(overallNonDemoMod.logr$formula,data = trainSet,
+                    family = "binomial")
+#then make predictions
+consideredObservationFrame = householdFrame[which(householdFrame["week"]
+                                                == "Week of 704"),]
+#alter aspects of this dataset for our prediction purposes; i.e. move back
+#time-dependent observations
+consideredObservationFrame$eggPurchase_week3 = (
+                                consideredObservationFrame$eggPurchase_week2)
+consideredObservationFrame$eggPurchase_week2 = (
+                                consideredObservationFrame$eggPurchase_week1)
+consideredObservationFrame$eggPurchase_week1 = (
+                                consideredObservationFrame$eggPurchase_week0)
+#drop current time
+consideredObservationFrame = consideredObservationFrame[
+                        ,!(colnames(consideredObservationFrame) == "eggPurchase_week0")]
+#then make predictions
+consideredObservationFrame$probability = predict(finalMod.logr,
+                        newdata = consideredObservationFrame,type = "response")
+#then export the table
+exportTable = consideredObservationFrame[,c("household_key","probability")]
+write.csv(exportTable,file = "../data/predictions/polarBear_predictions.csv",
+          row.names = FALSE)
+```

@@ -1,0 +1,1 @@
+eggPurchase_week0 ~ eggPurchase_week1 + eggPurchase_week2 + eggPurchase_week3 + numBaskets
