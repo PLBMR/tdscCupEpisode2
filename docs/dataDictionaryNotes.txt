@@ -1,4 +1,0 @@
-Data Dictionary Notes
-Description: Contains my notes on ../8451_TDSC_Data_Dictionary.pdf
-Last Updated: 9/7/2016 10:08 PM
--
